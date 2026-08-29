@@ -15,6 +15,16 @@
      1) положим этот файл в репозиторий
      2) в Dashboard → Environment добавляем MONGO_URI
      3) Build: npm install   Start: node server.js
+
+   На Vercel (Serverless Function):
+     - mongoose ДОЛЖЕН быть в корневом package.json: Vercel устанавливает
+       зависимости из корня проекта, а не из папки server/.
+     - В Dashboard → Environment → добавьте переменную MONGO_URI.
+     - Этот файл экспортирует module.exports = async (req, res) => … —
+       Vercel вызывает его автоматически. Cold start подключается к MongoDB
+       один раз; warm-инстанция переиспользует соединение через connectMongoDB.
+     - В корне: vercel.json → rewrites /api/* → /server/server.js,
+       остальной трафик (Vite static) раздаётся из dist/.
    ============================================================ */
 
 'use strict';
@@ -27,6 +37,33 @@ const mongoose = require('mongoose');
 
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
+
+/* ============================================================
+|    КЕШ ПОДКЛЮЧЕНИЯ К MONGODB (для Serverless / Vercel)
+|    В serverless-среде (Vercel) тёплая (warm) инстанция функции
+|    переиспользуется между запросами, поэтому соединение с MongoDB
+|    кэшируем (global), чтобы не открывать новое соединение и не
+|    расходовать лимиты на каждом вызове.
+    ============================================================ */
+let cachedPromise = global.__mongooseConnectPromise;
+
+async function connectMongoDB() {
+  if (cachedPromise) return cachedPromise;
+  if (!MONGO_URI) throw new Error('❌ process.env.MONGO_URI is not set');
+
+  cachedPromise = mongoose.connect(MONGO_URI, { bufferCommands: false });
+  global.__mongooseConnectPromise = cachedPromise;
+
+  try {
+    await cachedPromise;
+  } catch (err) {
+    // Сбрасываем кэш, чтобы следующая invocation могла переподключиться.
+    cachedPromise = null;
+    global.__mongooseConnectPromise = null;
+    throw err;
+  }
+  return cachedPromise;
+}
 const SERVER_DIR = __dirname;
 const SITE_DIR = path.join(SERVER_DIR, '..');
 
@@ -429,7 +466,7 @@ async function bootstrap() {
   }
 
   try {
-    await mongoose.connect(MONGO_URI);
+    await connectMongoDB();
     console.log('✅ MongoDB подключена');
   } catch (err) {
     console.error('❌ Не удалось подключиться к MongoDB:', err.message);
@@ -470,5 +507,52 @@ async function bootstrap() {
   });
 }
 
-// Запуск только при прямом выполнении файла (удобно для тестов)
+// Запуск только при прямом выполнении файла (локальный режим: http.createServer).
+// В Vercel `require.main !== module`, поэтому bootstrap() НЕ вызывается —
+// Vercel вызывает экспортированный ниже handler (module.exports).
 if (require.main === module) bootstrap();
+
+/* ============================================================
+|    ЭКСПОРТ ДЛЯ Vercel Serverless Function (module.exports)
+|
+|    module.exports = async (req, res) => {...}  ← Vercel вызывает это.
+|    - req/res — стандартные http.IncomingMessage/ServerResponse.
+|    - connectMongoDB() кэширует соединение (см. выше): cold start
+|      подключается один раз, warm-инстанция переиспользует.
+|    - Обрабатываются ТОЛЬКО запросы /api/* (остальное — Vite static
+|      на Vercel); ниже нормализуем путь, чтобы handleApi всегда
+|      видел префикс /api (Vercel может его убрать при роутинге).
+    ============================================================ */
+module.exports = async (req, res) => {
+  // Жёсткая проверка переменной окружения (важно для cold start в Vercel).
+  if (!MONGO_URI) {
+    return json(res, 500, { error: '❌ MONGO_URI is not configured on the server.' });
+  }
+
+  // Кешируем соединение: cold start подключается один раз,
+  // warm-инстанция переиспользует уже открытое соединение.
+  try {
+    await connectMongoDB();
+  } catch (err) {
+    console.error('❌ MongoDB connection error:', err.message);
+    return json(res, 500, { error: 'Database connection failed' });
+  }
+
+  let url;
+  try {
+    url = new URL(req.url, 'http://localhost');
+  } catch {
+    return json(res, 400, { error: 'Bad URL' });
+  }
+
+  // Vercel может маршрутизировать /api/x на функцию, убирая префикс /api.
+  // Гарантируем, что handleApi всегда видит путь вида /api/...
+  if (!url.pathname.startsWith('/api')) {
+    url = new URL('/api' + url.pathname + url.search, 'http://localhost');
+  }
+
+  return handleApi(req, res, url).catch((err) => {
+    console.error(err);
+    json(res, 500, { error: 'Server error' });
+  });
+};
